@@ -51,7 +51,8 @@ st.markdown('<div class="main-title">📈 個股機器學習多期評價與買�
 # -------------------------------------------------------------
 st.sidebar.header("⚙️ 選股與回測參數設定")
 
-ticker_symbol = st.sidebar.text_input("輸入個股代號 (Yahoo Finance)", value="AAPL")
+# 自動將輸入轉為大寫，避免因大小寫導致找不到代號
+ticker_symbol = st.sidebar.text_input("輸入個股代號 (Yahoo Finance)", value="AAPL").strip().upper()
 forecast_horizon = st.sidebar.selectbox("選擇預測天期 (Horizon)", options=[3, 1], format_func=lambda x: f"預測未來 {x} 個月")
 
 strategy_mode = st.sidebar.selectbox(
@@ -102,7 +103,7 @@ if run_btn:
             sp500_prices = df_prices["^GSPC"] if "^GSPC" in df_prices.columns else stock_prices
             vix_series = df_prices["^VIX"] if "^VIX" in df_prices.columns else pd.Series(20.0, index=df_prices.index)
 
-            # 抓取基本面數據 (若 yfinance 支援 info 取得本益比等)
+            # 抓取基本面數據
             ticker_obj = yf.Ticker(ticker_symbol)
             try:
                 info = ticker_obj.info
@@ -152,7 +153,6 @@ if run_btn:
             macro_df["VIX"] = vix_m
 
             # 模擬基本面與動能特徵
-            # 假設本益比隨股價與歷史本益比基準聯動，營收/獲利成長率由滾動報酬代理
             macro_df["Estimated_PE"] = base_pe * (df_m["Close"] / df_m["Close"].rolling(12).mean())
             macro_df["Earnings_Growth_Proxy"] = df_m["Close"].pct_change(12) * 100
             macro_df["Stock_Mom"] = prices_m.pct_change(momentum_window) * 100
@@ -211,7 +211,6 @@ if run_btn:
                             impacts = X_te_scaled[0] * model.coef_
 
                 current_price = test_row["Close"]
-                # 模型建議價格 = 當前價格 * (1 + 預測報酬率%)
                 predicted_price = current_price * (1.0 + pred_return / 100.0) if not np.isnan(pred_return) else np.nan
 
                 record = {
@@ -276,7 +275,7 @@ if st.session_state.get("stock_prediction_executed", False):
             mcol3.metric("目標結算日", latest_target_date, f"模型: {'LightGBM' if HAS_LGB else 'RidgeCV'}")
 
         # -------------------------------------------------------------
-        # 📊 繪製互動式股價與建議價圖表
+        # 📊 繪製互動式圖表
         # -------------------------------------------------------------
         valid_chart_df = results_df.dropna(subset=["Predicted_Price", "Current_Price"]).copy()
         if not valid_chart_df.empty:
@@ -329,7 +328,7 @@ if st.session_state.get("stock_prediction_executed", False):
             st.plotly_chart(fig, use_container_width=True)
 
         # -------------------------------------------------------------
-        # 📊 方向勝率與期望值摘要
+        # 📊 勝率與期望值摘要
         # -------------------------------------------------------------
         valid_eval = results_df.dropna(subset=["Actual_Return", "Predicted_Return"]).copy()
         if not valid_eval.empty:
@@ -356,7 +355,7 @@ if st.session_state.get("stock_prediction_executed", False):
         col3.metric("模型評估指標", "LightGBM / RidgeCV", f"預測週期: {horizon_val}M")
 
         # -------------------------------------------------------------
-        # 💰 模擬交易策略回測與淨值曲線
+        # 💰 策略回測與淨值曲線
         # -------------------------------------------------------------
         st.markdown(f'<div class="section-header">💰 策略模擬交易淨值曲線 vs 買進持有 [{mode_val}]</div>', unsafe_allow_html=True)
         
