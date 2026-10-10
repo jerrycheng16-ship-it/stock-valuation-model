@@ -436,4 +436,47 @@ if st.session_state.get("stock_prediction_executed", False):
             pcol4.metric("回測期間", f"{years:.1f} 年", f"{len(backtest_df)} 個交易點")
 
             nav_chart_df = backtest_df[["Strategy_Nav", "Benchmark_Nav"]].copy()
-            nav_chart_df.columns = [f"策略淨值曲線 ({mode_val})", f"{t_sym} 買
+            nav_chart_df.columns = [f"策略淨值曲線 ({mode_val})", f"{t_sym} 買進持有 (Benchmark)"]
+            st.line_chart(nav_chart_df)
+        else:
+            st.warning("⚠️ 目前回測期間資料不足，無法計算策略績效。")
+
+        # -------------------------------------------------------------
+        # 📅 每月預測明細表
+        # -------------------------------------------------------------
+        st.markdown(f'<div class="section-header">📅 每月預測與模擬交易訊號明細表</div>', unsafe_allow_html=True)
+        
+        show_table_df = results_df[[
+            "Target_Date", "Current_Price", "Predicted_Price", "Predicted_Return", "Actual_Return"
+        ]].copy()
+
+        show_table_df["預測看漲超標"] = show_table_df["Predicted_Return"] > thresh_val
+        if "現金" in mode_val:
+            show_table_df["策略訊號動作"] = np.where(show_table_df["預測看漲超標"], "🟢 買入並持有", "🔴 平倉 / 持有現金")
+        else:
+            show_table_df["策略訊號動作"] = np.where(
+                show_table_df["Predicted_Return"] > thresh_val, "🟢 做多 (Long)",
+                np.where(show_table_df["Predicted_Return"] < -thresh_val, "🔴 放空 (Short)", "🟡 觀望 / 現金")
+            )
+
+        show_table_df["Pred_Dir"] = show_table_df["Predicted_Return"] > thresh_val
+        show_table_df["Actual_Dir"] = show_table_df["Actual_Return"] > 0
+        show_table_df["方向勝率判斷"] = np.where(
+            show_table_df["Actual_Return"].isna() | show_table_df["Predicted_Return"].isna(),
+            "⏳ 最新即時預測 (待揭曉)",
+            np.where(show_table_df["Pred_Dir"] == show_table_df["Actual_Dir"], "✅ 正確 (Hit)", "❌ 錯誤 (Miss)")
+        )
+        
+        show_table_df["Target_Date"] = pd.to_datetime(show_table_df["Target_Date"]).dt.strftime("%Y-%m-%d")
+        show_table_df.index = show_table_df.index.strftime("%Y-%m-%d")
+        
+        final_display_df = show_table_df[[
+            "Target_Date", "Current_Price", "Predicted_Price", "Predicted_Return", "Actual_Return", "策略訊號動作", "方向勝率判斷"
+        ]].copy()
+
+        final_display_df.columns = [
+            f"預測目標月份 (+{horizon_val}M)", "當月基準價 ($)", "模型建議價 ($)", "預測報酬率 (%)", "實際未來報酬 (%)", "策略訊號動作", "方向預測結果"
+        ]
+        
+        final_display_df = final_display_df.sort_index(ascending=False)
+        st.dataframe(final_display_df.round(2), use_container_width=True)
