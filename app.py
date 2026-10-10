@@ -35,7 +35,7 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-st.markdown('<div class="main-title">📊 個股基本面評價與價值投資回測系統 (盈餘成長率、淨利率、營收成長)</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-title">📊 個股基本面評價與價值投資回測系統 (含計算明細與拆解)</div>', unsafe_allow_html=True)
 
 # -------------------------------------------------------------
 # 側邊欄參數設定
@@ -72,16 +72,16 @@ if run_btn:
                 
             stock_prices = df_hist["Close"]
             
-            # 【修正】移除時區資訊，避免時區比對錯誤
+            # 移除時區資訊，避免時區比對錯誤
             if stock_prices.index.tz is not None:
                 stock_prices.index = stock_prices.index.tz_localize(None)
 
-            # 嘗試取得財務報表以計算最新基本面特徵
+            # 取得財務報表
             income_stmt = ticker.quarterly_income_stmt
             
-            # 初始化財務指標預設值
-            latest_net_margin = 0.15
-            latest_rev_growth = 0.08
+            # 預設基本面數值
+            latest_net_margin = 0.20
+            latest_rev_growth = 0.10
             latest_eps = 5.0
             
             if income_stmt is not None and not income_stmt.empty:
@@ -95,17 +95,17 @@ if run_btn:
                     if len(revs) >= 4 and len(nets) >= 4:
                         ttm_rev = revs.iloc[:4].sum()
                         prev_ttm_rev = revs.iloc[4:8].sum() if len(revs) >= 8 else ttm_rev
-                        latest_rev_growth = (ttm_rev - prev_ttm_rev) / prev_ttm_rev if prev_ttm_rev > 0 else 0.08
+                        latest_rev_growth = (ttm_rev - prev_ttm_rev) / prev_ttm_rev if prev_ttm_rev > 0 else 0.10
                         
                         ttm_net = nets.iloc[:4].sum()
-                        latest_net_margin = ttm_net / ttm_rev if ttm_rev > 0 else 0.15
+                        latest_net_margin = ttm_net / ttm_rev if ttm_rev > 0 else 0.20
                 
                 if eps_rows:
                     epss = income_stmt.loc[eps_rows[0]].dropna()
                     if len(epss) >= 4:
                         latest_eps = epss.iloc[:4].sum()
 
-            # 建立月頻資料與基本面評價模型
+            # 建立月頻資料與合理價計算
             df_m = stock_prices.resample("ME").last().ffill()
             
             eval_records = []
@@ -115,15 +115,22 @@ if run_btn:
                 if date > pd.to_datetime(target_end_date):
                     break
                 
+                # 模擬歷史各時點的 TTM EPS (基於股價與最新財報比例回推，確保歷史合理價有合理的起伏)
+                # 實際應用中若有完整歷史財報資料庫可直接帶入當期 EPS
+                historical_eps = max(0.5, latest_eps * (price / df_m.iloc[-1] * 0.7 + 0.3))
+                
+                # 計算合理本益比 = 基准 P/E * (1 + 營收成長率)
                 implied_pe = max(10.0, base_pe * (1.0 + latest_rev_growth))
-                implied_eps = max(1.0, latest_eps * (price / df_m.iloc[0]))
-                theoretical_price = implied_eps * implied_pe
+                
+                # 理論合理價 = 預估 EPS * 合理本益比
+                theoretical_price = historical_eps * implied_pe
                 
                 eval_records.append({
                     "Date": date,
                     "Close": price,
-                    "Revenue_Growth": latest_rev_growth * 100,
-                    "Net_Margin": latest_net_margin * 100,
+                    "Estimated_EPS": historical_eps,
+                    "Revenue_Growth_Pct": latest_rev_growth * 100,
+                    "Implied_PE": implied_pe,
                     "Theoretical_Price": theoretical_price,
                     "Buy_Threshold_Price": theoretical_price * (1.0 - margin_of_safety / 100.0)
                 })
@@ -153,14 +160,14 @@ if st.session_state.get("fundamental_executed", False):
         curr_p = latest_row["Close"]
         theo_p = latest_row["Theoretical_Price"]
         buy_p = latest_row["Buy_Threshold_Price"]
-        rev_g = latest_row["Revenue_Growth"]
-        n_mar = latest_row["Net_Margin"]
+        est_eps = latest_row["Estimated_EPS"]
+        imp_pe = latest_row["Implied_PE"]
 
         mcol1, mcol2, mcol3, mcol4 = st.columns(4)
         mcol1.metric("目前最新股價", f"${curr_p:.2f}")
-        mcol2.metric("基本面理論合理價", f"${theo_p:.2f}", f"營收成長: {rev_g:.1f}%")
+        mcol2.metric("基本面理論合理價", f"${theo_p:.2f}", f"預估 EPS: ${est_eps:.2f}")
         mcol3.metric(f"安全邊際買入價 (-{mos}%)", f"${buy_p:.2f}")
-        mcol4.metric("淨利潤率 (Profit Margin)", f"{n_mar:.1f}%")
+        mcol4.metric("適用合理本益比", f"{imp_pe:.1f} 倍")
 
         # -------------------------------------------------------------
         # 📊 互動式圖表
@@ -228,3 +235,22 @@ if st.session_state.get("fundamental_executed", False):
         nav_chart_df = bt_df[["Strategy_Nav", "Benchmark_Nav"]].copy()
         nav_chart_df.columns = ["基本面價值策略淨值", f"{t_sym} 買進持有"]
         st.line_chart(nav_chart_df)
+
+        # -------------------------------------------------------------
+        # 📅 計算過程與明細表格
+        # -------------------------------------------------------------
+        st.markdown(f'<div class="section-header">📋 每月基本面評價與計算過程明細表</div>', unsafe_allow_html=True)
+        
+        display_table = res_df[[
+            "Close", "Estimated_EPS", "Revenue_Growth_Pct", "Implied_PE", "Theoretical_Price", "Buy_Threshold_Price"
+        ]].copy()
+        
+        display_table["評估狀態"] = np.where(display_table["Close"] < display_table["Buy_Threshold_Price"], "🟢 低估 (建議買入)",
+                                     np.where(display_table["Close"] > display_table["Theoretical_Price"], "🔴 高估 (建議賣出)", "🟡 合理區間 (觀望)"))
+        
+        display_table.columns = [
+            "實際收盤價 ($)", "預估每股盈餘 (EPS)", "營收成長率 (%)", "適用合理本益比", "理論合理價 ($)", "安全邊際買入價 (-15%)", "評價狀態"
+        ]
+        
+        display_table.index = display_table.index.strftime("%Y-%m-%d")
+        st.dataframe(display_table.sort_index(ascending=False).round(2), use_container_width=True)
