@@ -71,17 +71,20 @@ if run_btn:
                 st.stop()
                 
             stock_prices = df_hist["Close"]
+            
+            # 【修正】移除時區資訊，避免時區比對錯誤
+            if stock_prices.index.tz is not None:
+                stock_prices.index = stock_prices.index.tz_localize(None)
 
             # 嘗試取得財務報表以計算最新基本面特徵
             income_stmt = ticker.quarterly_income_stmt
             
-            # 初始化財務指標預設值（若財報格式不符時的備用防禦）
+            # 初始化財務指標預設值
             latest_net_margin = 0.15
             latest_rev_growth = 0.08
             latest_eps = 5.0
             
             if income_stmt is not None and not income_stmt.empty:
-                # 嘗試提取必要欄位 (不同公司欄位名稱可能略有不同)
                 rev_rows = [r for r in income_stmt.index if 'Total Revenue' in r or 'Revenue' in r]
                 net_rows = [r for r in income_stmt.index if 'Net Income' in r]
                 eps_rows = [r for r in income_stmt.index if 'Basic EPS' in r or 'Diluted EPS' in r]
@@ -90,7 +93,6 @@ if run_btn:
                     revs = income_stmt.loc[rev_rows[0]].dropna()
                     nets = income_stmt.loc[net_rows[0]].dropna()
                     if len(revs) >= 4 and len(nets) >= 4:
-                        # 計算 TTM (最近四季總和)
                         ttm_rev = revs.iloc[:4].sum()
                         prev_ttm_rev = revs.iloc[4:8].sum() if len(revs) >= 8 else ttm_rev
                         latest_rev_growth = (ttm_rev - prev_ttm_rev) / prev_ttm_rev if prev_ttm_rev > 0 else 0.08
@@ -113,10 +115,8 @@ if run_btn:
                 if date > pd.to_datetime(target_end_date):
                     break
                 
-                # 模擬基於動態盈餘與成長率的合理本益比與理論價格
-                # 理論 P/E = 基准 P/E * (1 + 預估盈餘成長率調整)
                 implied_pe = max(10.0, base_pe * (1.0 + latest_rev_growth))
-                implied_eps = max(1.0, latest_eps * (price / df_m.iloc[0])) # 隨股價趨勢與財報比例滾動模擬歷史 EPS
+                implied_eps = max(1.0, latest_eps * (price / df_m.iloc[0]))
                 theoretical_price = implied_eps * implied_pe
                 
                 eval_records.append({
@@ -203,10 +203,9 @@ if st.session_state.get("fundamental_executed", False):
         st.markdown(f'<div class="section-header">💰 基本面價值策略模擬淨值曲線 vs 買進持有</div>', unsafe_allow_html=True)
         
         bt_df = res_df.copy()
-        # 策略邏輯：當股價低於「安全邊際買入價」時買入/持有，當股價高於「理論合理價」時賣出/轉為現金
         bt_df["Signal"] = np.where(bt_df["Close"] < bt_df["Buy_Threshold_Price"], 1, 
                                    np.where(bt_df["Close"] > bt_df["Theoretical_Price"], 0, np.nan))
-        bt_df["Signal"] = bt_df["Signal"].ffill().fillna(0) # 維持上一次的部位
+        bt_df["Signal"] = bt_df["Signal"].ffill().fillna(0)
         
         stock_ret = bt_df["Close"].pct_change().fillna(0)
         bt_df["Strategy_Return"] = bt_df["Signal"].shift(1) * stock_ret
