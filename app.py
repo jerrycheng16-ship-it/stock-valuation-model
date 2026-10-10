@@ -60,7 +60,7 @@ strategy_mode = st.sidebar.selectbox(
     index=0
 )
 
-# 新增信心門檻：預測報酬率必須大於此數值才進場，避免盲目看多
+# 信心門檻：預測報酬率必須大於此數值才進場
 buy_threshold = st.sidebar.slider("買進預測報酬率門檻 (%)", min_value=0.0, max_value=5.0, value=1.0, step=0.5, help="預測報酬率必須大於此門檻才發出買進訊號，否則轉為現金/空手")
 
 momentum_window = st.sidebar.selectbox(
@@ -369,4 +369,80 @@ if st.session_state.get("stock_prediction_executed", False):
 
             if "現金" in mode_val:
                 backtest_df["Signal"] = np.where(backtest_df["Predicted_Return"] > thresh_val, 1, 0)
-                backtest_df["Strategy_Return"] = backtest_df["Signal"].shift(1) * stock
+                backtest_df["Strategy_Return"] = backtest_df["Signal"].shift(1) * stock_ret
+            else:
+                backtest_df["Signal"] = np.where(backtest_df["Predicted_Return"] > thresh_val, 1, np.where(backtest_df["Predicted_Return"] < -thresh_val, -1, 0))
+                backtest_df["Strategy_Return"] = backtest_df["Signal"].shift(1) * stock_ret
+
+            backtest_df["Strategy_Return"] = backtest_df["Strategy_Return"].fillna(0)
+            backtest_df["Benchmark_Nav"] = (1.0 + stock_ret.fillna(0)).cumprod()
+            backtest_df["Strategy_Nav"] = (1.0 + backtest_df["Strategy_Return"]).cumprod()
+
+            total_days = (backtest_df.index[-1] - backtest_df.index[0]).days
+            years = max(total_days / 365.25, 0.5)
+            
+            strat_total_return = backtest_df["Strategy_Nav"].iloc[-1] - 1.0
+            strat_cagr = (backtest_df["Strategy_Nav"].iloc[-1] ** (1 / years)) - 1.0
+            
+            bench_total_return = backtest_df["Benchmark_Nav"].iloc[-1] - 1.0
+            bench_cagr = (backtest_df["Benchmark_Nav"].iloc[-1] ** (1 / years)) - 1.0
+
+            strat_rolling_max = backtest_df["Strategy_Nav"].cummax()
+            strat_drawdown = (backtest_df["Strategy_Nav"] - strat_rolling_max) / strat_rolling_max
+            strat_mdd = strat_drawdown.min()
+
+            bench_rolling_max = backtest_df["Benchmark_Nav"].cummax()
+            bench_drawdown = (backtest_df["Benchmark_Nav"] - bench_rolling_max) / bench_rolling_max
+            bench_mdd = bench_drawdown.min()
+
+            pcol1, pcol2, pcol3, pcol4 = st.columns(4)
+            pcol1.metric("策略年化報酬率 (CAGR)", f"{strat_cagr * 100:.2f}%", f"買進持有: {bench_cagr * 100:.2f}%")
+            pcol2.metric("策略總報酬率", f"{strat_total_return * 100:.2f}%", f"買進持有: {bench_total_return * 100:.2f}%")
+            pcol3.metric("策略最大回落 (MDD)", f"{strat_mdd * 100:.2f}%", f"買進持有: {bench_mdd * 100:.2f}%")
+            pcol4.metric("回測期間", f"{years:.1f} 年", f"{len(backtest_df)} 個交易點")
+
+            nav_chart_df = backtest_df[["Strategy_Nav", "Benchmark_Nav"]].copy()
+            nav_chart_df.columns = [f"策略淨值曲線 ({mode_val})", f"{t_sym} 買進持有 (Benchmark)"]
+            st.line_chart(nav_chart_df)
+        else:
+            st.warning("⚠️ 目前回測期間資料不足，無法計算策略績效。")
+
+        # -------------------------------------------------------------
+        # 📅 每月預測明細表
+        # -------------------------------------------------------------
+        st.markdown(f'<div class="section-header">📅 每月預測與模擬交易訊號明細表</div>', unsafe_allow_html=True)
+        
+        show_table_df = results_df[[
+            "Target_Date", "Current_Price", "Predicted_Price", "Predicted_Return", "Actual_Return"
+        ]].copy()
+
+        show_table_df["預測看漲超標"] = show_table_df["Predicted_Return"] > thresh_val
+        if "現金" in mode_val:
+            show_table_df["策略訊號動作"] = np.where(show_table_df["預測看漲超標"], "🟢 買入並持有", "🔴 平倉 / 持有現金")
+        else:
+            show_table_df["策略訊號動作"] = np.where(
+                show_table_df["Predicted_Return"] > thresh_val, "🟢 做多 (Long)",
+                np.where(show_table_df["Predicted_Return"] < -thresh_val, "🔴 放空 (Short)", "🟡 觀望 / 現金")
+            )
+
+        show_table_df["Pred_Dir"] = show_table_df["Predicted_Return"] > thresh_val
+        show_table_df["Actual_Dir"] = show_table_df["Actual_Return"] > 0
+        show_table_df["方向勝率判斷"] = np.where(
+            show_table_df["Actual_Return"].isna() | show_table_df["Predicted_Return"].isna(),
+            "⏳ 最新即時預測 (待揭曉)",
+            np.where(show_table_df["Pred_Dir"] == show_table_df["Actual_Dir"], "✅ 正確 (Hit)", "❌ 錯誤 (Miss)")
+        )
+        
+        show_table_df["Target_Date"] = pd.to_datetime(show_table_df["Target_Date"]).dt.strftime("%Y-%m-%d")
+        show_table_df.index = show_table_df.index.strftime("%Y-%m-%d")
+        
+        final_display_df = show_table_df[[
+            "Target_Date", "Current_Price", "Predicted_Price", "Predicted_Return", "Actual_Return", "策略訊號動作", "方向勝率判斷"
+        ]].copy()
+
+        final_display_df.columns = [
+            f"預測目標月份 (+{horizon_val}M)", "當月基準價 ($)", "模型建議價 ($)", "預測報酬率 (%)", "實際未來報酬 (%)", "策略訊號動作", "方向預測結果"
+        ]
+        
+        final_display_df = final_display_df.sort_index(ascending=False)
+        st.dataframe(final_display_df.round(2), use_container_width=True)
