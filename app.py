@@ -5,6 +5,7 @@ import yfinance as yf
 import plotly.graph_objects as go
 from requests import Session
 from sklearn.preprocessing import StandardScaler
+from fredapi import Fred
 
 try:
     import lightgbm as lgb
@@ -15,7 +16,7 @@ except ImportError:
 from sklearn.linear_model import RidgeCV
 
 # 網頁版面設定
-st.set_page_config(page_title="個股機器學習多期評價與策略回測系統", layout="wide")
+st.set_page_config(page_title="個股機器學習多期評價與策略回測系統 (總經月度高頻版)", layout="wide")
 
 st.markdown(
     """
@@ -44,12 +45,23 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-st.markdown('<div class="main-title">📈 個股機器學習多期評價與買賣策略回測系統 (動態門檻升級版)</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-title">📈 個股機器學習多期評價與策略回測系統 (結合每月高頻總經/基本面指標)</div>', unsafe_allow_html=True)
 
 # -------------------------------------------------------------
 # 側邊欄參數設定
 # -------------------------------------------------------------
-st.sidebar.header("⚙️ 選股與回測參數設定")
+st.sidebar.header("⚙️ API 與回測參數設定")
+
+default_fred_key = ""
+try:
+    if "FRED_API_KEY" in st.secrets:
+        default_fred_key = st.secrets["FRED_API_KEY"]
+except Exception:
+    pass
+
+fred_api_key = st.sidebar.text_input("FRED API Key (必填，用於獲取每月高頻總經數據)", type="password", value=default_fred_key)
+if not fred_api_key:
+    st.sidebar.warning("⚠️ 請先輸入您的 FRED API Key 方可載入每月高頻總經基本面數據。")
 
 ticker_symbol = st.sidebar.text_input("輸入個股代號 (Yahoo Finance)", value="AAPL").strip().upper()
 forecast_horizon = st.sidebar.selectbox("選擇預測天期 (Horizon)", options=[3, 1], format_func=lambda x: f"預測未來 {x} 個月")
@@ -60,7 +72,6 @@ strategy_mode = st.sidebar.selectbox(
     index=0
 )
 
-# 信心門檻：預測報酬率必須大於此數值才進場
 buy_threshold = st.sidebar.slider("買進預測報酬率門檻 (%)", min_value=0.0, max_value=5.0, value=1.0, step=0.5, help="預測報酬率必須大於此門檻才發出買進訊號，否則轉為現金/空手")
 
 momentum_window = st.sidebar.selectbox(
@@ -80,169 +91,192 @@ if "stock_prediction_executed" not in st.session_state:
     st.session_state.stock_prediction_executed = False
 
 if run_btn:
-    with st.spinner(f"正在下載 {ticker_symbol} 歷史數據與計算特徵..."):
-        try:
-            session = Session()
-            session.headers.update({
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            })
-            
-            tickers = [ticker_symbol, "^GSPC", "^VIX"]
-            df_raw = yf.download(tickers, start="2010-01-01", progress=False, session=session)
-            df_prices = df_raw["Adj Close"] if "Adj Close" in df_raw.columns else df_raw["Close"]
-            
-            if isinstance(df_prices, pd.Series):
-                df_prices = df_prices.to_frame(name=ticker_symbol)
-                df_prices["^GSPC"] = df_prices[ticker_symbol]
-                df_prices["^VIX"] = 20.0
-            
-            if ticker_symbol not in df_prices.columns:
-                st.error(f"❌ 找不到代號 {ticker_symbol} 的數據，請確認代號是否正確。")
-                st.stop()
-                
-            stock_prices = df_prices[ticker_symbol]
-            sp500_prices = df_prices["^GSPC"] if "^GSPC" in df_prices.columns else stock_prices
-            vix_series = df_prices["^VIX"] if "^VIX" in df_prices.columns else pd.Series(20.0, index=df_prices.index)
-
-            ticker_obj = yf.Ticker(ticker_symbol)
+    if not fred_api_key:
+        st.error("❌ 請先在側邊欄輸入 FRED API Key！")
+    else:
+        with st.spinner(f"正在同步 FRED 每月高頻總經數據與 {ticker_symbol} 股價特徵..."):
             try:
-                info = ticker_obj.info
-                base_pe = info.get("trailingPE", 20.0)
-                if base_pe is None or base_pe <= 0:
-                    base_pe = 20.0
-            except Exception:
-                base_pe = 20.0
+                # 1. 抓取每月公布的高頻總經與基本面替代指標
+                fred = Fred(api_key=fred_api_key.strip())
+                napm = fred.get_series('NAPM')          # ISM 製造業 PMI (每月初公布)
+                retail = fred.get_series('RSXFS')       # 零售銷售 (每月中公布)
+                indpro = fred.get_series('INDPRO')      # 工業生產指數
+                cpi = fred.get_series('CPIAUCSL')       # 消費者物價指數 (通膨)
 
-            def calculate_rsi(series, period=14):
-                delta = series.diff()
-                gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-                loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-                rs = gain / loss
-                return 100 - (100 / (1 + rs))
+                macro_raw = pd.DataFrame({
+                    'ISM_PMI': napm,
+                    'Retail_Sales': retail,
+                    'Industrial_Production': indpro,
+                    'CPI': cpi
+                })
+                # 轉為月變動率 (MoM) 或保持絕對水準，這裡取零售與工業生產的月增率，PMI與CPI取數值
+                macro_raw['Retail_Sales_MoM'] = macro_raw['Retail_Sales'].pct_change() * 100
+                macro_raw['Industrial_Production_MoM'] = macro_raw['Industrial_Production'].pct_change() * 100
+                macro_raw['CPI_YoY'] = macro_raw['CPI'].pct_change(12) * 100
 
-            def calculate_macd_diff(series, fast=12, slow=26, signal=9):
-                exp1 = series.ewm(span=fast, adjust=False).mean()
-                exp2 = series.ewm(span=slow, adjust=False).mean()
-                macd = exp1 - exp2
-                signal_line = macd.ewm(span=signal, adjust=False).mean()
-                return macd - signal_line
+            except Exception as e:
+                st.error(f"❌ FRED API 連線或抓取數據失敗: {e}")
+                st.stop()
 
-            daily_df = pd.DataFrame(index=stock_prices.index)
-            daily_df["Close"] = stock_prices
-            daily_df["RSI_14"] = calculate_rsi(stock_prices, 14)
-            daily_df["MACD_Diff"] = calculate_macd_diff(stock_prices)
-            daily_df["MA20_Ratio"] = stock_prices / stock_prices.rolling(20).mean() - 1.0
-            daily_df["MA60_Ratio"] = stock_prices / stock_prices.rolling(60).mean() - 1.0
-            daily_df["Volatility"] = stock_prices.pct_change().rolling(20).std() * np.sqrt(252)
+            try:
+                session = Session()
+                session.headers.update({
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                })
+                
+                tickers = [ticker_symbol, "^GSPC", "^VIX"]
+                df_raw = yf.download(tickers, start="2010-01-01", progress=False, session=session)
+                df_prices = df_raw["Adj Close"] if "Adj Close" in df_raw.columns else df_raw["Close"]
+                
+                if isinstance(df_prices, pd.Series):
+                    df_prices = df_prices.to_frame(name=ticker_symbol)
+                    df_prices["^GSPC"] = df_prices[ticker_symbol]
+                    df_prices["^VIX"] = 20.0
+                
+                if ticker_symbol not in df_prices.columns:
+                    st.error(f"❌ 找不到代號 {ticker_symbol} 的數據，請確認代號是否正確。")
+                    st.stop()
+                    
+                stock_prices = df_prices[ticker_symbol]
+                sp500_prices = df_prices["^GSPC"] if "^GSPC" in df_prices.columns else stock_prices
+                vix_series = df_prices["^VIX"] if "^VIX" in df_prices.columns else pd.Series(20.0, index=df_prices.index)
 
-            df_m = daily_df.resample("ME").last().ffill()
-            prices_m = stock_prices.resample("ME").last().ffill()
-            sp500_m = sp500_prices.resample("ME").last().ffill()
-            vix_m = vix_series.resample("ME").last().ffill()
+                def calculate_rsi(series, period=14):
+                    delta = series.diff()
+                    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+                    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+                    rs = gain / loss
+                    return 100 - (100 / (1 + rs))
 
-            macro_df = pd.DataFrame(index=df_m.index)
-            macro_df["Close"] = df_m["Close"]
-            macro_df["RSI_14"] = df_m["RSI_14"]
-            macro_df["MACD_Diff"] = df_m["MACD_Diff"]
-            macro_df["MA20_Ratio"] = df_m["MA20_Ratio"]
-            macro_df["MA60_Ratio"] = df_m["MA60_Ratio"]
-            macro_df["Volatility"] = df_m["Volatility"]
-            macro_df["VIX"] = vix_m
+                def calculate_macd_diff(series, fast=12, slow=26, signal=9):
+                    exp1 = series.ewm(span=fast, adjust=False).mean()
+                    exp2 = series.ewm(span=slow, adjust=False).mean()
+                    macd = exp1 - exp2
+                    signal_line = macd.ewm(span=signal, adjust=False).mean()
+                    return macd - signal_line
 
-            macro_df["Estimated_PE"] = base_pe * (df_m["Close"] / df_m["Close"].rolling(12).mean())
-            macro_df["Earnings_Growth_Proxy"] = df_m["Close"].pct_change(12) * 100
-            macro_df["Stock_Mom"] = prices_m.pct_change(momentum_window) * 100
-            macro_df["Relative_Mom"] = (prices_m.pct_change(momentum_window) - sp500_m.pct_change(momentum_window)) * 100
+                daily_df = pd.DataFrame(index=stock_prices.index)
+                daily_df["Close"] = stock_prices
+                daily_df["RSI_14"] = calculate_rsi(stock_prices, 14)
+                daily_df["MACD_Diff"] = calculate_macd_diff(stock_prices)
+                daily_df["MA20_Ratio"] = stock_prices / stock_prices.rolling(20).mean() - 1.0
+                daily_df["MA60_Ratio"] = stock_prices / stock_prices.rolling(60).mean() - 1.0
+                daily_df["Volatility"] = stock_prices.pct_change().rolling(20).std() * np.sqrt(252)
 
-            macro_df["Future_Close"] = macro_df["Close"].shift(-forecast_horizon)
-            macro_df["Target_Return"] = (macro_df["Future_Close"] / macro_df["Close"] - 1.0) * 100
+                df_m = daily_df.resample("ME").last().ffill()
+                prices_m = stock_prices.resample("ME").last().ffill()
+                sp500_m = sp500_prices.resample("ME").last().ffill()
+                vix_m = vix_series.resample("ME").last().ffill()
 
-            feature_cols = [
-                "Estimated_PE", "Earnings_Growth_Proxy", "Stock_Mom", "Relative_Mom",
-                "RSI_14", "MACD_Diff", "MA20_Ratio", "MA60_Ratio", "Volatility", "VIX"
-            ]
+                macro_df = pd.DataFrame(index=df_m.index)
+                macro_df["Close"] = df_m["Close"]
+                macro_df["RSI_14"] = df_m["RSI_14"]
+                macro_df["MACD_Diff"] = df_m["MACD_Diff"]
+                macro_df["MA20_Ratio"] = df_m["MA20_Ratio"]
+                macro_df["MA60_Ratio"] = df_m["MA60_Ratio"]
+                macro_df["Volatility"] = df_m["Volatility"]
+                macro_df["VIX"] = vix_m
 
-            dates = macro_df.index.sort_values()
-            detailed_records = []
+                # 整合每月高頻總經指標
+                macro_df["ISM_PMI"] = macro_raw["ISM_PMI"].reindex(macro_df.index).ffill()
+                macro_df["Retail_MoM"] = macro_raw["Retail_Sales_MoM"].reindex(macro_df.index).ffill()
+                macro_df["IndPro_MoM"] = macro_raw["Industrial_Production_MoM"].reindex(macro_df.index).ffill()
+                macro_df["CPI_YoY"] = macro_raw["CPI_YoY"].reindex(macro_df.index).ffill()
 
-            start_idx = max(train_window, momentum_window, 12)
-            if start_idx >= len(dates) - forecast_horizon:
-                start_idx = max(12, len(dates) // 2)
+                # 個股動能特徵
+                macro_df["Stock_Mom"] = prices_m.pct_change(momentum_window) * 100
+                macro_df["Relative_Mom"] = (prices_m.pct_change(momentum_window) - sp500_m.pct_change(momentum_window)) * 100
 
-            for t in range(start_idx, len(dates)):
-                test_date = dates[t]
-                test_row = macro_df.iloc[t]
-                target_forecast_date = test_date + pd.offsets.MonthEnd(forecast_horizon)
+                # 目標變數：未來 H 個月的報酬率 (%)
+                macro_df["Future_Close"] = macro_df["Close"].shift(-forecast_horizon)
+                macro_df["Target_Return"] = (macro_df["Future_Close"] / macro_df["Close"] - 1.0) * 100
 
-                feat_values = test_row[feature_cols].values
-                has_missing = pd.isna(feat_values).any()
+                feature_cols = [
+                    "ISM_PMI", "Retail_MoM", "IndPro_MoM", "CPI_YoY",
+                    "Stock_Mom", "Relative_Mom", "RSI_14", "MACD_Diff", "MA20_Ratio", "Volatility", "VIX"
+                ]
 
-                pred_return = np.nan
-                impacts = [np.nan] * len(feature_cols)
+                dates = macro_df.index.sort_values()
+                detailed_records = []
 
-                if not has_missing:
-                    train_subset = macro_df.iloc[:t].dropna(subset=feature_cols + ["Target_Return"])
-                    if len(train_subset) >= 12:
-                        if len(train_subset) > train_window:
-                            train_subset = train_subset.iloc[-train_window:]
+                start_idx = max(train_window, momentum_window, 12)
+                if start_idx >= len(dates) - forecast_horizon:
+                    start_idx = max(12, len(dates) // 2)
 
-                        X_tr = train_subset[feature_cols]
-                        y_tr = train_subset["Target_Return"]
-                        X_te = test_row[feature_cols].values.reshape(1, -1)
+                for t in range(start_idx, len(dates)):
+                    test_date = dates[t]
+                    test_row = macro_df.iloc[t]
+                    target_forecast_date = test_date + pd.offsets.MonthEnd(forecast_horizon)
 
-                        scaler = StandardScaler()
-                        X_tr_scaled = scaler.fit_transform(X_tr)
-                        X_te_scaled = scaler.transform(X_te)
+                    feat_values = test_row[feature_cols].values
+                    has_missing = pd.isna(feat_values).any()
 
-                        if HAS_LGB:
-                            model = lgb.LGBMRegressor(n_estimators=50, learning_rate=0.05, max_depth=3, random_state=42, verbose=-1)
-                            model.fit(X_tr_scaled, y_tr)
-                            pred_return = model.predict(X_te_scaled)[0]
-                            if hasattr(model, "feature_importances_"):
-                                impacts = X_te_scaled[0] * (model.feature_importances_ / model.feature_importances_.sum())
-                        else:
-                            model = RidgeCV(alphas=np.logspace(-2, 4, 10)).fit(X_tr_scaled, y_tr)
-                            pred_return = model.predict(X_te_scaled)[0]
-                            impacts = X_te_scaled[0] * model.coef_
+                    pred_return = np.nan
+                    impacts = [np.nan] * len(feature_cols)
 
-                current_price = test_row["Close"]
-                predicted_price = current_price * (1.0 + pred_return / 100.0) if not np.isnan(pred_return) else np.nan
+                    if not has_missing:
+                        train_subset = macro_df.iloc[:t].dropna(subset=feature_cols + ["Target_Return"])
+                        if len(train_subset) >= 12:
+                            if len(train_subset) > train_window:
+                                train_subset = train_subset.iloc[-train_window:]
 
-                record = {
-                    "Feature_Date": test_date,
-                    "Target_Date": target_forecast_date,
-                    "Current_Price": current_price,
-                    "Actual_Future_Price": test_row["Future_Close"],
-                    "Actual_Return": test_row["Target_Return"],
-                    "Predicted_Return": pred_return,
-                    "Predicted_Price": predicted_price,
-                }
-                for i, col in enumerate(feature_cols):
-                    record[f"{col}_Value"] = test_row[col]
-                    record[f"{col}_Impact"] = impacts[i]
+                            X_tr = train_subset[feature_cols]
+                            y_tr = train_subset["Target_Return"]
+                            X_te = test_row[feature_cols].values.reshape(1, -1)
 
-                detailed_records.append(record)
+                            scaler = StandardScaler()
+                            X_tr_scaled = scaler.fit_transform(X_tr)
+                            X_te_scaled = scaler.transform(X_te)
 
-            results_df = pd.DataFrame(detailed_records)
-            if not results_df.empty:
-                results_df["Feature_Date"] = pd.to_datetime(results_df["Feature_Date"])
-                results_df = results_df.set_index("Feature_Date")
-                results_df = results_df.loc[pd.to_datetime(target_start_date):pd.to_datetime(target_end_date) + pd.DateOffset(months=forecast_horizon)]
+                            if HAS_LGB:
+                                model = lgb.LGBMRegressor(n_estimators=50, learning_rate=0.05, max_depth=3, random_state=42, verbose=-1)
+                                model.fit(X_tr_scaled, y_tr)
+                                pred_return = model.predict(X_te_scaled)[0]
+                                if hasattr(model, "feature_importances_"):
+                                    impacts = X_te_scaled[0] * (model.feature_importances_ / model.feature_importances_.sum())
+                            else:
+                                model = RidgeCV(alphas=np.logspace(-2, 4, 10)).fit(X_tr_scaled, y_tr)
+                                pred_return = model.predict(X_te_scaled)[0]
+                                impacts = X_te_scaled[0] * model.coef_
 
-            if results_df.empty:
-                st.error("在您設定的回測期間內沒有足夠的資料，請將回測開始日期調早！")
-            else:
-                st.session_state.stock_prediction_executed = True
-                st.session_state.results_df = results_df
-                st.session_state.feature_cols = feature_cols
-                st.session_state.forecast_horizon = forecast_horizon
-                st.session_state.strategy_mode = strategy_mode
-                st.session_state.buy_threshold = buy_threshold
-                st.session_state.momentum_window = momentum_window
-                st.session_state.ticker_symbol = ticker_symbol
+                    current_price = test_row["Close"]
+                    predicted_price = current_price * (1.0 + pred_return / 100.0) if not np.isnan(pred_return) else np.nan
 
-        except Exception as e:
-            st.error(f"❌ 執行過程發生錯誤: {e}")
+                    record = {
+                        "Feature_Date": test_date,
+                        "Target_Date": target_forecast_date,
+                        "Current_Price": current_price,
+                        "Actual_Future_Price": test_row["Future_Close"],
+                        "Actual_Return": test_row["Target_Return"],
+                        "Predicted_Return": pred_return,
+                        "Predicted_Price": predicted_price,
+                    }
+                    for i, col in enumerate(feature_cols):
+                        record[f"{col}_Value"] = test_row[col]
+                        record[f"{col}_Impact"] = impacts[i]
+
+                    detailed_records.append(record)
+
+                results_df = pd.DataFrame(detailed_records)
+                if not results_df.empty:
+                    results_df["Feature_Date"] = pd.to_datetime(results_df["Feature_Date"])
+                    results_df = results_df.set_index("Feature_Date")
+                    results_df = results_df.loc[pd.to_datetime(target_start_date):pd.to_datetime(target_end_date) + pd.DateOffset(months=forecast_horizon)]
+
+                if results_df.empty:
+                    st.error("在您設定的回測期間內沒有足夠的資料，請將回測開始日期調早！")
+                else:
+                    st.session_state.stock_prediction_executed = True
+                    st.session_state.results_df = results_df
+                    st.session_state.feature_cols = feature_cols
+                    st.session_state.forecast_horizon = forecast_horizon
+                    st.session_state.strategy_mode = strategy_mode
+                    st.session_state.buy_threshold = buy_threshold
+                    st.session_state.momentum_window = momentum_window
+                    st.session_state.ticker_symbol = ticker_symbol
+
+            except Exception as e:
+                st.error(f"❌ 執行過程發生錯誤: {e}")
 
 if st.session_state.get("stock_prediction_executed", False):
     results_df = st.session_state.get("results_df")
@@ -272,7 +306,7 @@ if st.session_state.get("stock_prediction_executed", False):
             mcol3.metric("目標結算日", latest_target_date, f"模型: {'LightGBM' if HAS_LGB else 'RidgeCV'}")
 
         # -------------------------------------------------------------
-        # 📊 繪製互動式圖表 (加入動態門檻)
+        # 📊 互動式圖表
         # -------------------------------------------------------------
         valid_chart_df = results_df.dropna(subset=["Predicted_Price", "Current_Price"]).copy()
         if not valid_chart_df.empty:
@@ -402,47 +436,4 @@ if st.session_state.get("stock_prediction_executed", False):
             pcol4.metric("回測期間", f"{years:.1f} 年", f"{len(backtest_df)} 個交易點")
 
             nav_chart_df = backtest_df[["Strategy_Nav", "Benchmark_Nav"]].copy()
-            nav_chart_df.columns = [f"策略淨值曲線 ({mode_val})", f"{t_sym} 買進持有 (Benchmark)"]
-            st.line_chart(nav_chart_df)
-        else:
-            st.warning("⚠️ 目前回測期間資料不足，無法計算策略績效。")
-
-        # -------------------------------------------------------------
-        # 📅 每月預測明細表
-        # -------------------------------------------------------------
-        st.markdown(f'<div class="section-header">📅 每月預測與模擬交易訊號明細表</div>', unsafe_allow_html=True)
-        
-        show_table_df = results_df[[
-            "Target_Date", "Current_Price", "Predicted_Price", "Predicted_Return", "Actual_Return"
-        ]].copy()
-
-        show_table_df["預測看漲超標"] = show_table_df["Predicted_Return"] > thresh_val
-        if "現金" in mode_val:
-            show_table_df["策略訊號動作"] = np.where(show_table_df["預測看漲超標"], "🟢 買入並持有", "🔴 平倉 / 持有現金")
-        else:
-            show_table_df["策略訊號動作"] = np.where(
-                show_table_df["Predicted_Return"] > thresh_val, "🟢 做多 (Long)",
-                np.where(show_table_df["Predicted_Return"] < -thresh_val, "🔴 放空 (Short)", "🟡 觀望 / 現金")
-            )
-
-        show_table_df["Pred_Dir"] = show_table_df["Predicted_Return"] > thresh_val
-        show_table_df["Actual_Dir"] = show_table_df["Actual_Return"] > 0
-        show_table_df["方向勝率判斷"] = np.where(
-            show_table_df["Actual_Return"].isna() | show_table_df["Predicted_Return"].isna(),
-            "⏳ 最新即時預測 (待揭曉)",
-            np.where(show_table_df["Pred_Dir"] == show_table_df["Actual_Dir"], "✅ 正確 (Hit)", "❌ 錯誤 (Miss)")
-        )
-        
-        show_table_df["Target_Date"] = pd.to_datetime(show_table_df["Target_Date"]).dt.strftime("%Y-%m-%d")
-        show_table_df.index = show_table_df.index.strftime("%Y-%m-%d")
-        
-        final_display_df = show_table_df[[
-            "Target_Date", "Current_Price", "Predicted_Price", "Predicted_Return", "Actual_Return", "策略訊號動作", "方向勝率判斷"
-        ]].copy()
-
-        final_display_df.columns = [
-            f"預測目標月份 (+{horizon_val}M)", "當月基準價 ($)", "模型建議價 ($)", "預測報酬率 (%)", "實際未來報酬 (%)", "策略訊號動作", "方向預測結果"
-        ]
-        
-        final_display_df = final_display_df.sort_index(ascending=False)
-        st.dataframe(final_display_df.round(2), use_container_width=True)
+            nav_chart_df.columns = [f"策略淨值曲線 ({mode_val})", f"{t_sym} 買
