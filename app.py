@@ -15,7 +15,7 @@ except ImportError:
 from sklearn.linear_model import RidgeCV
 
 # 網頁版面設定
-st.set_page_config(page_title="個股機器學習多期評價與策略回測系統 (穩健總經與技術高頻版)", layout="wide")
+st.set_page_config(page_title="個股機器學習多期評價與策略回測系統 (純價格與技術高頻版)", layout="wide")
 
 st.markdown(
     """
@@ -44,7 +44,7 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-st.markdown('<div class="main-title">📈 個股機器學習多期評價與策略回測系統 (結合市場與總經高頻特徵)</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-title">📈 個股機器學習多期評價與策略回測系統 (專注價格行為與相對動能)</div>', unsafe_allow_html=True)
 
 # -------------------------------------------------------------
 # 側邊欄參數設定
@@ -79,25 +79,21 @@ if "stock_prediction_executed" not in st.session_state:
     st.session_state.stock_prediction_executed = False
 
 if run_btn:
-    with st.spinner(f"正在同步市場與總經高頻數據，並計算 {ticker_symbol} 特徵..."):
+    with st.spinner(f"正在同步個股與大盤價格數據，並計算 {ticker_symbol} 純技術與相對強弱特徵..."):
         try:
             session = Session()
             session.headers.update({
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             })
             
-            # 同時抓取個股、S&P500大盤、VIX恐慌指數、10年期公債 (^TNX)、黃金 (GC=F)、原油 (CL=F)
-            tickers = [ticker_symbol, "^GSPC", "^VIX", "^TNX", "GC=F", "CL=F"]
+            # 僅抓取個股與 S&P 500 大盤，去除雜訊總經變數
+            tickers = [ticker_symbol, "^GSPC"]
             df_raw = yf.download(tickers, start="2010-01-01", progress=False, session=session)
             df_prices = df_raw["Adj Close"] if "Adj Close" in df_raw.columns else df_raw["Close"]
             
             if isinstance(df_prices, pd.Series):
                 df_prices = df_prices.to_frame(name=ticker_symbol)
                 df_prices["^GSPC"] = df_prices[ticker_symbol]
-                df_prices["^VIX"] = 20.0
-                df_prices["^TNX"] = 3.0
-                df_prices["GC=F"] = 1500.0
-                df_prices["CL=F"] = 70.0
 
             if ticker_symbol not in df_prices.columns:
                 st.error(f"❌ 找不到代號 {ticker_symbol} 的數據，請確認代號是否正確。")
@@ -105,10 +101,6 @@ if run_btn:
                 
             stock_prices = df_prices[ticker_symbol].ffill().bfill()
             sp500_prices = df_prices["^GSPC"].ffill().bfill() if "^GSPC" in df_prices.columns else stock_prices
-            vix_series = df_prices["^VIX"].ffill().bfill() if "^VIX" in df_prices.columns else pd.Series(20.0, index=stock_prices.index)
-            tnx_series = df_prices["^TNX"].ffill().bfill() if "^TNX" in df_prices.columns else pd.Series(3.0, index=stock_prices.index)
-            gold_series = df_prices["GC=F"].ffill().bfill() if "GC=F" in df_prices.columns else pd.Series(1500.0, index=stock_prices.index)
-            oil_series = df_prices["CL=F"].ffill().bfill() if "CL=F" in df_prices.columns else pd.Series(70.0, index=stock_prices.index)
 
             def calculate_rsi(series, period=14):
                 delta = series.diff()
@@ -136,10 +128,6 @@ if run_btn:
             df_m = daily_df.resample("ME").last().ffill()
             prices_m = stock_prices.resample("ME").last().ffill()
             sp500_m = sp500_prices.resample("ME").last().ffill()
-            vix_m = vix_series.resample("ME").last().ffill()
-            tnx_m = tnx_series.resample("ME").last().ffill()
-            gold_m = gold_series.resample("ME").last().ffill()
-            oil_m = oil_series.resample("ME").last().ffill()
 
             macro_df = pd.DataFrame(index=df_m.index)
             macro_df["Close"] = df_m["Close"]
@@ -149,24 +137,22 @@ if run_btn:
             macro_df["MA60_Ratio"] = df_m["MA60_Ratio"]
             macro_df["Volatility"] = df_m["Volatility"]
             
-            # 高頻宏觀與商品環境特徵
-            macro_df["VIX"] = vix_m
-            macro_df["Bond_Yield_10Y"] = tnx_m                      # 10年期公債殖利率 (反映資金成本)
-            macro_df["Gold_MoM"] = gold_m.pct_change() * 100        # 黃金月增率 (避險情緒)
-            macro_df["Oil_MoM"] = oil_m.pct_change() * 100          # 原油月增率 (通膨/能源成本)
-            macro_df["Market_Mom"] = sp500_m.pct_change(momentum_window) * 100 # 大盤動能
-
-            # 個股動能特徵
+            # 純價格動能與跨市場相對強弱特徵
+            macro_df["Market_Mom"] = sp500_m.pct_change(momentum_window) * 100
             macro_df["Stock_Mom"] = prices_m.pct_change(momentum_window) * 100
             macro_df["Relative_Mom"] = (prices_m.pct_change(momentum_window) - sp500_m.pct_change(momentum_window)) * 100
+
+            # 多重時間尺度輔助動能 (捕捉短中長期疊加)
+            macro_df["Stock_Mom_1M"] = prices_m.pct_change(1) * 100
+            macro_df["Stock_Mom_3M"] = prices_m.pct_change(3) * 100
 
             # 目標變數：未來 H 個月的報酬率 (%)
             macro_df["Future_Close"] = macro_df["Close"].shift(-forecast_horizon)
             macro_df["Target_Return"] = (macro_df["Future_Close"] / macro_df["Close"] - 1.0) * 100
 
             feature_cols = [
-                "VIX", "Bond_Yield_10Y", "Gold_MoM", "Oil_MoM", "Market_Mom",
-                "Stock_Mom", "Relative_Mom", "RSI_14", "MACD_Diff", "MA20_Ratio", "Volatility"
+                "Stock_Mom", "Relative_Mom", "Stock_Mom_1M", "Stock_Mom_3M",
+                "Market_Mom", "RSI_14", "MACD_Diff", "MA20_Ratio", "MA60_Ratio", "Volatility"
             ]
 
             dates = macro_df.index.sort_values()
@@ -434,7 +420,7 @@ if st.session_state.get("stock_prediction_executed", False):
 
         show_table_df["Pred_Dir"] = show_table_df["Predicted_Return"] > thresh_val
         show_table_df["Actual_Dir"] = show_table_df["Actual_Return"] > 0
-        show_table_df["方向勝率判斷"] = np.where(
+        show_table_df["方向預測結果"] = np.where(
             show_table_df["Actual_Return"].isna() | show_table_df["Predicted_Return"].isna(),
             "⏳ 最新即時預測 (待揭曉)",
             np.where(show_table_df["Pred_Dir"] == show_table_df["Actual_Dir"], "✅ 正確 (Hit)", "❌ 錯誤 (Miss)")
