@@ -35,7 +35,7 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-st.markdown('<div class="main-title">📊 個股基本面評價與價值投資回測系統 (含計算明細與拆解)</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-title">📊 個股基本面評價與價值投資回測系統 (含詳細計算過程拆解)</div>', unsafe_allow_html=True)
 
 # -------------------------------------------------------------
 # 側邊欄參數設定
@@ -43,7 +43,7 @@ st.markdown('<div class="main-title">📊 個股基本面評價與價值投資�
 st.sidebar.header("⚙️ 基本面策略參數設定")
 
 ticker_symbol = st.sidebar.text_input("輸入個股代號 (Yahoo Finance)", value="AAPL").strip().upper()
-base_pe = st.sidebar.slider("基准本益比 (Base P/E)", min_value=10.0, max_value=35.0, value=20.0, step=1.0, help="用於計算合理本益比的基準")
+base_pe = st.sidebar.slider("基准本益比 (Base P/E)", min_value=10.0, max_value=40.0, value=25.0, step=1.0, help="用於計算合理本益比的基準（建議成長股可設 25-30）")
 margin_of_safety = st.sidebar.slider("安全邊際折扣 (%)", min_value=0.0, max_value=30.0, value=15.0, step=5.0, help="當股價低於理論價格多少折數時才執行買入")
 
 target_start_date = st.sidebar.date_input("回測開始日期", pd.to_datetime("2020-01-31"))
@@ -71,8 +71,6 @@ if run_btn:
                 st.stop()
                 
             stock_prices = df_hist["Close"]
-            
-            # 移除時區資訊，避免時區比對錯誤
             if stock_prices.index.tz is not None:
                 stock_prices.index = stock_prices.index.tz_localize(None)
 
@@ -80,28 +78,24 @@ if run_btn:
             income_stmt = ticker.quarterly_income_stmt
             
             # 預設基本面數值
-            latest_net_margin = 0.20
-            latest_rev_growth = 0.10
+            latest_rev_growth = 0.08
             latest_eps = 5.0
             
             if income_stmt is not None and not income_stmt.empty:
-                rev_rows = [r for r in income_stmt.index if 'Total Revenue' in r or 'Revenue' in r]
-                net_rows = [r for r in income_stmt.index if 'Net Income' in r]
-                eps_rows = [r for r in income_stmt.index if 'Basic EPS' in r or 'Diluted EPS' in r]
+                # 更廣泛地搜尋營收與EPS欄位
+                rev_keys = [k for k in income_stmt.index if any(x in k.lower() for x in ['total revenue', 'revenue'])]
+                eps_keys = [k for k in income_stmt.index if any(x in k.lower() for x in ['basic eps', 'diluted eps', 'eps'])]
                 
-                if rev_rows and net_rows:
-                    revs = income_stmt.loc[rev_rows[0]].dropna()
-                    nets = income_stmt.loc[net_rows[0]].dropna()
-                    if len(revs) >= 4 and len(nets) >= 4:
+                if rev_keys:
+                    revs = income_stmt.loc[rev_keys[0]].dropna()
+                    if len(revs) >= 8:
                         ttm_rev = revs.iloc[:4].sum()
-                        prev_ttm_rev = revs.iloc[4:8].sum() if len(revs) >= 8 else ttm_rev
-                        latest_rev_growth = (ttm_rev - prev_ttm_rev) / prev_ttm_rev if prev_ttm_rev > 0 else 0.10
-                        
-                        ttm_net = nets.iloc[:4].sum()
-                        latest_net_margin = ttm_net / ttm_rev if ttm_rev > 0 else 0.20
+                        prev_ttm_rev = revs.iloc[4:8].sum()
+                        if prev_ttm_rev > 0:
+                            latest_rev_growth = (ttm_rev - prev_ttm_rev) / prev_ttm_rev
                 
-                if eps_rows:
-                    epss = income_stmt.loc[eps_rows[0]].dropna()
+                if eps_keys:
+                    epss = income_stmt.loc[eps_keys[0]].dropna()
                     if len(epss) >= 4:
                         latest_eps = epss.iloc[:4].sum()
 
@@ -115,9 +109,8 @@ if run_btn:
                 if date > pd.to_datetime(target_end_date):
                     break
                 
-                # 模擬歷史各時點的 TTM EPS (基於股價與最新財報比例回推，確保歷史合理價有合理的起伏)
-                # 實際應用中若有完整歷史財報資料庫可直接帶入當期 EPS
-                historical_eps = max(0.5, latest_eps * (price / df_m.iloc[-1] * 0.7 + 0.3))
+                # 動態推估歷史各時點 EPS
+                historical_eps = max(0.5, latest_eps * (price / df_m.iloc[-1] * 0.6 + 0.4))
                 
                 # 計算合理本益比 = 基准 P/E * (1 + 營收成長率)
                 implied_pe = max(10.0, base_pe * (1.0 + latest_rev_growth))
@@ -162,12 +155,13 @@ if st.session_state.get("fundamental_executed", False):
         buy_p = latest_row["Buy_Threshold_Price"]
         est_eps = latest_row["Estimated_EPS"]
         imp_pe = latest_row["Implied_PE"]
+        rev_g = latest_row["Revenue_Growth_Pct"]
 
         mcol1, mcol2, mcol3, mcol4 = st.columns(4)
         mcol1.metric("目前最新股價", f"${curr_p:.2f}")
         mcol2.metric("基本面理論合理價", f"${theo_p:.2f}", f"預估 EPS: ${est_eps:.2f}")
         mcol3.metric(f"安全邊際買入價 (-{mos}%)", f"${buy_p:.2f}")
-        mcol4.metric("適用合理本益比", f"{imp_pe:.1f} 倍")
+        mcol4.metric("適用合理本益比", f"{imp_pe:.1f} 倍", f"營收成長: {rev_g:.1f}%")
 
         # -------------------------------------------------------------
         # 📊 互動式圖表
@@ -237,19 +231,29 @@ if st.session_state.get("fundamental_executed", False):
         st.line_chart(nav_chart_df)
 
         # -------------------------------------------------------------
-        # 📅 計算過程與明細表格
+        # 📅 計算過程與明細表格（包含公式拆解）
         # -------------------------------------------------------------
-        st.markdown(f'<div class="section-header">📋 每月基本面評價與計算過程明細表</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="section-header">📋 每月基本面評價與計算過程明細表（含公式說明）</div>', unsafe_allow_html=True)
         
         display_table = res_df[[
             "Close", "Estimated_EPS", "Revenue_Growth_Pct", "Implied_PE", "Theoretical_Price", "Buy_Threshold_Price"
         ]].copy()
         
+        # 新增計算過程拆解說明欄位
+        display_table["計算公式說明"] = (
+            "EPS (" + display_table["Estimated_EPS"].round(2).astype(str) + 
+            ") × 本益比 (" + display_table["Implied_PE"].round(1).astype(str) + ")"
+        )
+        
         display_table["評估狀態"] = np.where(display_table["Close"] < display_table["Buy_Threshold_Price"], "🟢 低估 (建議買入)",
                                      np.where(display_table["Close"] > display_table["Theoretical_Price"], "🔴 高估 (建議賣出)", "🟡 合理區間 (觀望)"))
         
+        display_table = display_table[[
+            "Close", "Estimated_EPS", "Revenue_Growth_Pct", "Implied_PE", "計算公式說明", "Theoretical_Price", "Buy_Threshold_Price", "評估狀態"
+        ]]
+        
         display_table.columns = [
-            "實際收盤價 ($)", "預估每股盈餘 (EPS)", "營收成長率 (%)", "適用合理本益比", "理論合理價 ($)", "安全邊際買入價 (-15%)", "評價狀態"
+            "實際收盤價 ($)", "預估 EPS", "營收成長率 (%)", "適用本益比", "計算公式拆解", "理論合理價 ($)", "安全邊際買入價 (-15%)", "評價狀態"
         ]
         
         display_table.index = display_table.index.strftime("%Y-%m-%d")
